@@ -121,6 +121,10 @@ class QueueCore {
             return previous;
         }).catch((error) => {
             console.warn('SyncPlay updatePlayQueue:', error);
+            if (error?.message === 'Trying to apply old update') {
+                console.debug('[SyncPlayV2] stale_queue_update_detected_triggering_recovery');
+                this.manager.refreshJoinedGroupStateV2(apiClient, { allowEnable: true });
+            }
             return null;
         });
     }

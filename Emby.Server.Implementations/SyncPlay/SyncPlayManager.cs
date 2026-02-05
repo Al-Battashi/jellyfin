@@ -315,6 +315,66 @@ namespace Emby.Server.Implementations.SyncPlay
         }
 
         /// <inheritdoc />
+        public SyncPlayGroupStateV2Dto GetGroupStateV2(SessionInfo session, Guid groupId)
+        {
+            ArgumentNullException.ThrowIfNull(session);
+
+            var user = _userManager.GetUserById(session.UserId);
+
+            lock (_groupsLock)
+            {
+                if (!_groups.TryGetValue(groupId, out var group))
+                {
+                    return null;
+                }
+
+                // Locking required as group is not thread-safe.
+                lock (group)
+                {
+                    if (!group.HasAccessToPlayQueue(user))
+                    {
+                        return null;
+                    }
+
+                    return group.GetStateV2();
+                }
+            }
+        }
+
+        /// <inheritdoc />
+        public SyncPlayGroupStateV2Dto GetJoinedGroupStateV2(SessionInfo session)
+        {
+            ArgumentNullException.ThrowIfNull(session);
+
+            var user = _userManager.GetUserById(session.UserId);
+
+            lock (_groupsLock)
+            {
+                if (!_sessionToGroupMap.TryGetValue(session.Id, out var group))
+                {
+                    return null;
+                }
+
+                // Locking required as group is not thread-safe.
+                lock (group)
+                {
+                    if (!_sessionToGroupMap.TryGetValue(session.Id, out var checkGroup)
+                        || !checkGroup.GroupId.Equals(group.GroupId))
+                    {
+                        return null;
+                    }
+
+                    if (!group.HasAccessToPlayQueue(user))
+                    {
+                        return null;
+                    }
+
+                    return group.GetStateV2();
+                }
+            }
+        }
+
+        /// <inheritdoc />
         public void HandleRequest(SessionInfo session, IGroupPlaybackRequest request, CancellationToken cancellationToken)
         {
             if (session is null)

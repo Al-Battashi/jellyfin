@@ -39,6 +39,10 @@ class Manager {
         this.lastPlaybackCommand = null; // Last received playback command from server, tracks state of group.
         this.pendingSnapshot = null; // Snapshot received before SyncPlay is enabled.
         this.pendingResumePlayback = false; // Resume requested before queue became available.
+        this.latestJoinedStateRevision = -1; // Latest revision received from /SyncPlay/V2/Joined.
+        this.joinedStateRefreshPromise = null; // In-flight joined-state refresh.
+        this.joinedStateReconcileTimer = null; // Periodic v2 state reconciliation timer.
+        this.joinedStateReconcileMs = 4000; // Reconcile interval for authoritative v2 state.
 
         this.currentPlayer = null;
         this.playerWrapper = null;
@@ -63,7 +67,7 @@ class Manager {
 
         Events.on(this.timeSyncCore, 'time-sync-server-update', (event, timeOffset, ping) => {
             // Report ping back to server.
-            if (this.syncEnabled) {
+            if (this.isSyncPlayEnabled()) {
                 this.getApiClient().sendSyncPlayPing({
                     Ping: ping
                 });
@@ -80,7 +84,12 @@ class Manager {
             throw new Error('ApiClient is null!');
         }
 
+        const apiClientChanged = this.apiClient && this.apiClient !== apiClient;
         this.apiClient = apiClient;
+
+        if (apiClientChanged && this.isSyncPlayEnabled()) {
+            this.startJoinedStateReconcileLoop(apiClient);
+        }
     }
 
     /**
@@ -224,6 +233,7 @@ class Manager {
             case 'GroupJoined':
                 cmd.Data.LastUpdatedAt = new Date(cmd.Data.LastUpdatedAt);
                 this.enableSyncPlay(apiClient, cmd.Data, true);
+                this.refreshJoinedGroupStateV2(apiClient, { allowEnable: true });
                 break;
             case 'SyncPlayIsDisabled':
                 toast(globalize.translate('MessageSyncPlayIsDisabled'));
@@ -324,19 +334,205 @@ class Manager {
     }
 
     /**
+     * Writes a scoped SyncPlay v2 debug log event.
+     * @param {string} eventName The event name.
+     * @param {Object|undefined} details Optional event details.
+     */
+    logV2Event(eventName, details) {
+        if (details !== undefined) {
+            console.debug(`[SyncPlayV2] ${eventName}`, details);
+            return;
+        }
+
+        console.debug(`[SyncPlayV2] ${eventName}`);
+    }
+
+    /**
+     * Starts periodic reconciliation against authoritative /SyncPlay/V2/Joined state.
+     * @param {Object} apiClient The ApiClient.
+     */
+    startJoinedStateReconcileLoop(apiClient) {
+        this.stopJoinedStateReconcileLoop();
+
+        const client = apiClient || this.getApiClient();
+        if (!client) {
+            return;
+        }
+
+        this.joinedStateReconcileTimer = setInterval(() => {
+            if (!this.isSyncPlayEnabled()) {
+                return;
+            }
+
+            this.refreshJoinedGroupStateV2(client, { allowEnable: true }).then((applied) => {
+                if (applied) {
+                    this.logV2Event('reconcile_applied', { groupId: this.groupInfo?.GroupId, revision: this.latestJoinedStateRevision });
+                }
+            });
+        }, this.joinedStateReconcileMs);
+    }
+
+    /**
+     * Stops periodic v2 joined-state reconciliation.
+     */
+    stopJoinedStateReconcileLoop() {
+        if (!this.joinedStateReconcileTimer) {
+            return;
+        }
+
+        clearInterval(this.joinedStateReconcileTimer);
+        this.joinedStateReconcileTimer = null;
+    }
+
+    /**
+     * Extracts the HTTP status code from API client errors.
+     * @param {Object} error The error.
+     * @returns {number|null} HTTP status code.
+     */
+    getHttpStatus(error) {
+        return error?.statusCode
+            ?? error?.status
+            ?? error?.response?.status
+            ?? error?.xhr?.status
+            ?? null;
+    }
+
+    /**
+     * Fetches authoritative joined group state from the v2 endpoint.
+     * @param {Object} apiClient The ApiClient.
+     * @returns {Promise<Object|null>} The joined state, or null when user is not in a group.
+     */
+    async fetchJoinedGroupStateV2(apiClient) {
+        const client = apiClient || this.getApiClient();
+        if (!client) {
+            return null;
+        }
+
+        try {
+            const url = client.getUrl('SyncPlay/V2/Joined', { _: Date.now() });
+            const state = await client.getJSON(url);
+            return state || null;
+        } catch (error) {
+            const status = this.getHttpStatus(error);
+            if (status === 404) {
+                this.logV2Event('joined_state_not_found');
+                return null;
+            }
+
+            throw error;
+        }
+    }
+
+    /**
+     * Applies authoritative joined group state from the v2 endpoint.
+     * @param {Object} apiClient The ApiClient.
+     * @param {Object|null} joinedState The joined-state payload.
+     * @param {Object} options Apply options.
+     * @returns {boolean} True when state was applied.
+     */
+    applyJoinedGroupStateV2(apiClient, joinedState, options = {}) {
+        const { allowEnable = true } = options;
+        const snapshot = joinedState?.Snapshot;
+        if (!snapshot?.GroupInfo || !snapshot?.PlayQueue) {
+            return false;
+        }
+
+        const incomingRevision = Number(joinedState.Revision);
+        const hasIncomingRevision = Number.isFinite(incomingRevision);
+        if (hasIncomingRevision && this.latestJoinedStateRevision >= 0 && incomingRevision < this.latestJoinedStateRevision) {
+            this.logV2Event('ignore_stale_joined_state', {
+                incomingRevision,
+                currentRevision: this.latestJoinedStateRevision,
+                groupId: joinedState?.GroupId
+            });
+            return false;
+        }
+
+        const groupInfo = snapshot.GroupInfo;
+        groupInfo.LastUpdatedAt = new Date(groupInfo.LastUpdatedAt || joinedState.ServerUtcNow || Date.now());
+
+        if (allowEnable) {
+            const currentGroupId = this.groupInfo?.GroupId;
+            if (!this.isSyncPlayEnabled() || currentGroupId !== groupInfo.GroupId) {
+                this.enableSyncPlay(apiClient, groupInfo, false);
+            }
+        }
+
+        if (hasIncomingRevision) {
+            this.latestJoinedStateRevision = incomingRevision;
+        }
+
+        if (this.groupInfo?.GroupId !== groupInfo.GroupId) {
+            return false;
+        }
+
+        this.applySnapshot(snapshot, apiClient);
+        this.logV2Event('joined_state_applied', { groupId: groupInfo.GroupId, revision: this.latestJoinedStateRevision });
+        return true;
+    }
+
+    /**
+     * Refreshes joined group state from the server and applies it locally.
+     * @param {Object} apiClient The ApiClient.
+     * @param {Object} options Refresh options.
+     * @returns {Promise<boolean>} True when joined state was applied.
+     */
+    refreshJoinedGroupStateV2(apiClient, options = {}) {
+        const { allowEnable = true } = options;
+        const client = apiClient || this.getApiClient();
+        if (!client) {
+            return Promise.resolve(false);
+        }
+
+        if (this.joinedStateRefreshPromise) {
+            return this.joinedStateRefreshPromise;
+        }
+
+        this.joinedStateRefreshPromise = this.fetchJoinedGroupStateV2(client).then((joinedState) => {
+            if (!joinedState) {
+                return false;
+            }
+
+            return this.applyJoinedGroupStateV2(client, joinedState, { allowEnable });
+        }).catch((error) => {
+            console.debug('SyncPlay refreshJoinedGroupStateV2: failed', error);
+            return false;
+        }).finally(() => {
+            this.joinedStateRefreshPromise = null;
+        });
+
+        return this.joinedStateRefreshPromise;
+    }
+
+    /**
      * Applies a group snapshot without triggering playback actions.
      * @param {Object} snapshot The snapshot data.
      * @param {Object} apiClient The ApiClient.
      */
     applySnapshot(snapshot, apiClient) {
+        const snapshotRevision = Number(snapshot?.Revision);
+        const hasSnapshotRevision = Number.isFinite(snapshotRevision);
+        if (hasSnapshotRevision && this.latestJoinedStateRevision >= 0 && snapshotRevision < this.latestJoinedStateRevision) {
+            this.logV2Event('ignore_stale_snapshot', {
+                incomingRevision: snapshotRevision,
+                currentRevision: this.latestJoinedStateRevision
+            });
+            return;
+        }
+
+        if (hasSnapshotRevision) {
+            this.latestJoinedStateRevision = snapshotRevision;
+        }
+
         snapshot.GroupInfo.LastUpdatedAt = new Date(snapshot.GroupInfo.LastUpdatedAt);
         this.groupInfo = snapshot.GroupInfo;
 
-        const updatePromise = this.queueCore.updatePlayQueue(apiClient, snapshot.PlayQueue);
+        // Snapshots are reconciliation data and should not trigger queue side effects directly.
+        const updatePromise = this.queueCore.updatePlayQueue(apiClient, snapshot.PlayQueue, { suppressActions: true });
 
         if (!this.isIdleState(snapshot.GroupInfo.State)) {
             Promise.resolve(updatePromise).then(() => {
-                if (this.isFollowingGroupPlayback()) {
+                if (this.isFollowingGroupPlayback() && !this.isPlaybackActive()) {
                     this.resumeGroupPlayback(apiClient);
                 }
             });
@@ -448,9 +644,11 @@ class Manager {
         this.queueCore.reset();
         this.groupInfo = groupInfo;
         this.pendingResumePlayback = false;
+        this.latestJoinedStateRevision = -1;
 
         this.syncPlayEnabledAt = groupInfo.LastUpdatedAt;
         this.playerWrapper.bindToPlayer();
+        this.startJoinedStateReconcileLoop(apiClient);
 
         Events.trigger(this, 'enabled', [true]);
 
@@ -490,6 +688,9 @@ class Manager {
         this.queuedCommand = null;
         this.pendingResumePlayback = false;
         this.groupInfo = null;
+        this.latestJoinedStateRevision = -1;
+        this.joinedStateRefreshPromise = null;
+        this.stopJoinedStateReconcileLoop();
         this.queueCore.reset();
         this.playbackCore.syncEnabled = false;
         Events.trigger(this, 'enabled', [false]);
@@ -591,6 +792,11 @@ class Manager {
         try {
             if (!apiClient) {
                 return false;
+            }
+
+            const refreshedV2 = await this.refreshJoinedGroupStateV2(apiClient, { allowEnable: true });
+            if (refreshedV2) {
+                return true;
             }
 
             const user = await apiClient.getCurrentUser();

@@ -68,6 +68,9 @@ class PlaybackCore {
 
         // Whether sync correction during playback is active.
         this.enableSyncCorrection = toBoolean(getSetting('enableSyncCorrection'), false);
+
+        // Maximum command lateness tolerated before forcing authoritative v2 recovery, in milliseconds.
+        this.maxLateCommandMillis = toFloat(getSetting('maxLateCommandMillis'), 1200.0);
     }
 
     /**
@@ -171,6 +174,18 @@ class PlaybackCore {
      * @param {Object} command The playback command.
      */
     async applyCommand(command) {
+        const commandLatenessMillis = this.getCommandLatenessMillis(command);
+        if (commandLatenessMillis > this.maxLateCommandMillis
+            && command.Command !== 'Unpause'
+            && command.Command !== 'Seek') {
+            console.warn('[SyncPlayV2] stale_control_command_ignored', {
+                command: command.Command,
+                latenessMs: commandLatenessMillis
+            });
+            this.manager.refreshJoinedGroupStateV2(this.manager.getApiClient(), { allowEnable: true });
+            return;
+        }
+
         // Check if duplicate.
         if (this.lastCommand
             && this.lastCommand.When.getTime() === command.When.getTime()
@@ -268,6 +283,20 @@ class PlaybackCore {
                 console.error('SyncPlay applyCommand: command is not recognised:', command);
                 break;
         }
+    }
+
+    /**
+     * Gets how late a command is in local time, in milliseconds.
+     * @param {Object} command The playback command.
+     * @returns {number} Command lateness, where positive means stale.
+     */
+    getCommandLatenessMillis(command) {
+        if (!command || !command.When) {
+            return 0;
+        }
+
+        const commandLocalTime = this.timeSyncCore.remoteDateToLocal(command.When);
+        return Date.now() - commandLocalTime.getTime();
     }
 
     /**
@@ -388,6 +417,15 @@ class PlaybackCore {
         const currentTime = new Date();
         const seekAtTimeLocal = this.timeSyncCore.remoteDateToLocal(seekAtTime);
         const expectedSequence = commandSequence ?? this.commandSequence;
+        const commandLatenessMillis = Date.now() - seekAtTimeLocal.getTime();
+        if (commandLatenessMillis > this.maxLateCommandMillis) {
+            console.warn('[SyncPlayV2] stale_seek_command_ignored', {
+                latenessMs: commandLatenessMillis,
+                maxLateMs: this.maxLateCommandMillis
+            });
+            this.manager.refreshJoinedGroupStateV2(this.manager.getApiClient(), { allowEnable: true });
+            return;
+        }
 
         const callback = () => {
             if (expectedSequence !== this.commandSequence) {
@@ -395,7 +433,6 @@ class PlaybackCore {
                 return;
             }
 
-            this.localUnpause();
             this.localSeek(positionTicks);
 
             Helper.waitForEventOnce(this.manager, 'ready', Helper.WaitForEventDefaultTimeout).then(() => {
@@ -403,11 +440,11 @@ class PlaybackCore {
                     console.debug('SyncPlay scheduleSeek: command superseded before pause.');
                     return;
                 }
-                this.localPause();
                 this.sendBufferingRequest(false);
             }).catch((error) => {
                 console.error(`Timed out while waiting for 'ready' event! Seeking to ${positionTicks}.`, error);
                 this.localSeek(positionTicks);
+                this.sendBufferingRequest(false);
             });
         };
 

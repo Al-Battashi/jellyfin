@@ -61,10 +61,20 @@ class GroupSelectionMenu {
                 return Promise.resolve(null);
             }
 
-            const url = apiClient.getUrl(`SyncPlay/${groupId}`, { _: Date.now() });
-            return apiClient.getJSON(url).catch((error) => {
-                console.error('SyncPlay: error fetching group details:', error);
+            const v2Url = apiClient.getUrl(`SyncPlay/V2/${groupId}`, { _: Date.now() });
+            return apiClient.getJSON(v2Url).then((state) => {
+                if (state?.Snapshot?.GroupInfo) {
+                    return state.Snapshot.GroupInfo;
+                }
+
                 return null;
+            }).catch((error) => {
+                console.debug('SyncPlay: v2 group state unavailable, falling back to v1 group details.', error);
+                const v1Url = apiClient.getUrl(`SyncPlay/${groupId}`, { _: Date.now() });
+                return apiClient.getJSON(v1Url).catch((fallbackError) => {
+                    console.error('SyncPlay: error fetching group details:', fallbackError);
+                    return null;
+                });
             });
         };
         const buildMenuItems = (groups) => {
@@ -193,6 +203,9 @@ class GroupSelectionMenu {
 
             groupInfo.LastUpdatedAt = new Date(groupInfo.LastUpdatedAt);
             syncPlayManager.enableSyncPlay(apiClient, groupInfo, true);
+            if (syncPlayManager.refreshJoinedGroupStateV2) {
+                syncPlayManager.refreshJoinedGroupStateV2(apiClient, { allowEnable: true });
+            }
         };
         const selectGroup = (groups, { groupId, groupName }) => {
             if (!Array.isArray(groups) || groups.length === 0) {
@@ -459,30 +472,46 @@ class GroupSelectionMenu {
         ServerConnections.user(apiClient).then((user) => {
             const syncPlayManager = getSyncPlayManager();
             const userName = user?.localUser?.Name || user?.Name || '';
-            fetchGroups().then((groups) => {
-                const localGroupInfo = syncPlayManager?.getGroupInfo?.();
-                const groupInfo = selectGroupForUser(groups, userName) || selectGroupById(groups, localGroupInfo?.GroupId);
-                if (groupInfo && syncPlayManager) {
-                    groupInfo.LastUpdatedAt = new Date(groupInfo.LastUpdatedAt);
-                    syncPlayManager.enableSyncPlay(apiClient, groupInfo, false);
+            let rehydratePromise = Promise.resolve(false);
+            if (syncPlayManager?.refreshJoinedGroupStateV2) {
+                rehydratePromise = syncPlayManager.refreshJoinedGroupStateV2(apiClient, { allowEnable: true });
+            }
+
+            rehydratePromise.catch((error) => {
+                console.debug('SyncPlay: v2 rehydrate during menu open failed:', error);
+                return false;
+            }).then(() => {
+                const rehydratedGroupInfo = syncPlayManager?.getGroupInfo?.();
+                if (syncPlayManager?.isSyncPlayEnabled?.() && rehydratedGroupInfo) {
                     this.showLeaveGroupSelection(button, user, apiClient);
                     return;
                 }
 
-                if (syncPlayManager?.isSyncPlayEnabled?.() && localGroupInfo) {
-                    this.showLeaveGroupSelection(button, user, apiClient);
-                    return;
-                }
+                fetchGroups().then((groups) => {
+                    const localGroupInfo = syncPlayManager?.getGroupInfo?.();
+                    const groupInfo = selectGroupForUser(groups, userName) || selectGroupById(groups, localGroupInfo?.GroupId);
+                    if (groupInfo && syncPlayManager) {
+                        groupInfo.LastUpdatedAt = new Date(groupInfo.LastUpdatedAt);
+                        syncPlayManager.enableSyncPlay(apiClient, groupInfo, false);
+                        this.showLeaveGroupSelection(button, user, apiClient);
+                        return;
+                    }
 
-                this.showNewJoinGroupSelection(button, user, apiClient);
-            }).catch((error) => {
-                console.error('SyncPlay: failed to fetch groups during menu open:', error);
-                const enabledNow = syncPlayManager?.isSyncPlayEnabled?.() ?? this.syncPlayEnabled;
-                if (enabledNow && syncPlayManager?.getGroupInfo?.()) {
-                    this.showLeaveGroupSelection(button, user, apiClient);
-                } else {
+                    if (syncPlayManager?.isSyncPlayEnabled?.() && localGroupInfo) {
+                        this.showLeaveGroupSelection(button, user, apiClient);
+                        return;
+                    }
+
                     this.showNewJoinGroupSelection(button, user, apiClient);
-                }
+                }).catch((error) => {
+                    console.error('SyncPlay: failed to fetch groups during menu open:', error);
+                    const enabledNow = syncPlayManager?.isSyncPlayEnabled?.() ?? this.syncPlayEnabled;
+                    if (enabledNow && syncPlayManager?.getGroupInfo?.()) {
+                        this.showLeaveGroupSelection(button, user, apiClient);
+                    } else {
+                        this.showNewJoinGroupSelection(button, user, apiClient);
+                    }
+                });
             });
         }).catch((error) => {
             console.error(error);

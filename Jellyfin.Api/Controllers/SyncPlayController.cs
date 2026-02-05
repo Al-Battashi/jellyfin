@@ -129,6 +129,41 @@ public class SyncPlayController : BaseJellyfinApiController
     }
 
     /// <summary>
+    /// Gets the authoritative V2 state for the current joined SyncPlay group.
+    /// </summary>
+    /// <response code="200">State returned.</response>
+    /// <response code="404">Session is not currently in a group.</response>
+    /// <returns>A <see cref="SyncPlayGroupStateV2Dto"/> for the current group.</returns>
+    [HttpGet("V2/Joined")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [Authorize(Policy = Policies.SyncPlayJoinGroup)]
+    public async Task<ActionResult<SyncPlayGroupStateV2Dto>> SyncPlayGetJoinedGroupStateV2()
+    {
+        var currentSession = await RequestHelpers.GetSession(_sessionManager, _userManager, HttpContext).ConfigureAwait(false);
+        var state = _syncPlayManager.GetJoinedGroupStateV2(currentSession);
+        return state is null ? NotFound() : Ok(state);
+    }
+
+    /// <summary>
+    /// Gets the authoritative V2 state for a SyncPlay group by id.
+    /// </summary>
+    /// <param name="id">The id of the group.</param>
+    /// <response code="200">State returned.</response>
+    /// <response code="404">Group not found or inaccessible.</response>
+    /// <returns>A <see cref="SyncPlayGroupStateV2Dto"/> for the requested group.</returns>
+    [HttpGet("V2/{id:guid}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [Authorize(Policy = Policies.SyncPlayJoinGroup)]
+    public async Task<ActionResult<SyncPlayGroupStateV2Dto>> SyncPlayGetGroupStateV2([FromRoute] Guid id)
+    {
+        var currentSession = await RequestHelpers.GetSession(_sessionManager, _userManager, HttpContext).ConfigureAwait(false);
+        var state = _syncPlayManager.GetGroupStateV2(currentSession, id);
+        return state is null ? NotFound() : Ok(state);
+    }
+
+    /// <summary>
     /// Request to set new playlist in SyncPlay group.
     /// </summary>
     /// <param name="requestData">The new playlist to play in the group.</param>
