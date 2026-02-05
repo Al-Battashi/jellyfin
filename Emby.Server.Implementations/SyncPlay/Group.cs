@@ -278,6 +278,9 @@ namespace Emby.Server.Implementations.SyncPlay
 
             _state.SessionJoined(this, _state.Type, session, cancellationToken);
 
+            var snapshotUpdate = new SyncPlayGroupSnapshotUpdate(GroupId, BuildSnapshot());
+            SendGroupUpdate(session, SyncPlayBroadcastType.CurrentSession, snapshotUpdate, cancellationToken);
+
             _logger.LogInformation("Session {SessionId} created group {GroupId}.", session.Id, GroupId.ToString());
         }
 
@@ -298,6 +301,9 @@ namespace Emby.Server.Implementations.SyncPlay
             SendGroupUpdate(session, SyncPlayBroadcastType.AllExceptCurrentSession, updateOthers, cancellationToken);
 
             _state.SessionJoined(this, _state.Type, session, cancellationToken);
+
+            var snapshotUpdate = new SyncPlayGroupSnapshotUpdate(GroupId, BuildSnapshot());
+            SendGroupUpdate(session, SyncPlayBroadcastType.CurrentSession, snapshotUpdate, cancellationToken);
 
             _logger.LogInformation("Session {SessionId} joined group {GroupId}.", session.Id, GroupId.ToString());
         }
@@ -356,6 +362,20 @@ namespace Emby.Server.Implementations.SyncPlay
         {
             var participants = _participants.Values.Select(session => session.UserName).Distinct().ToList();
             return new GroupInfoDto(GroupId, GroupName, _state.Type, participants, DateTime.UtcNow);
+        }
+
+        private SyncPlayGroupSnapshotDto BuildSnapshot()
+        {
+            var groupInfo = GetInfo();
+            var playQueueUpdate = GetPlayQueueUpdate(PlayQueueUpdateReason.NewPlaylist);
+
+            SendCommand playingCommand = null;
+            if (_state.Type == GroupStateType.Playing)
+            {
+                playingCommand = NewSyncPlayCommand(SendCommandType.Unpause);
+            }
+
+            return new SyncPlayGroupSnapshotDto(groupInfo, playQueueUpdate, playingCommand, DateTime.UtcNow);
         }
 
         /// <summary>

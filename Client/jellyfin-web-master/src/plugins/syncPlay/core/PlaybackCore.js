@@ -26,6 +26,7 @@ class PlaybackCore {
         this.lastCommand = null; // Last scheduled playback command, might not be the latest one.
         this.scheduledCommandTimeout = null;
         this.syncTimeout = null;
+        this.commandSequence = 0;
 
         this.loadPreferences();
     }
@@ -241,6 +242,8 @@ class PlaybackCore {
         }
 
         // Applying command.
+        this.commandSequence += 1;
+        const commandSequence = this.commandSequence;
         this.lastCommand = command;
 
         // Ignore if remote player has local SyncPlay manager.
@@ -259,7 +262,7 @@ class PlaybackCore {
                 this.scheduleStop(command.When);
                 break;
             case 'Seek':
-                this.scheduleSeek(command.When, command.PositionTicks);
+                this.scheduleSeek(command.When, command.PositionTicks, commandSequence);
                 break;
             default:
                 console.error('SyncPlay applyCommand: command is not recognised:', command);
@@ -380,16 +383,26 @@ class PlaybackCore {
      * @param {Date} seekAtTime The server's UTC time at which to seek playback.
      * @param {number} positionTicks The PositionTicks where player will be seeked.
      */
-    scheduleSeek(seekAtTime, positionTicks) {
+    scheduleSeek(seekAtTime, positionTicks, commandSequence) {
         this.clearScheduledCommand();
         const currentTime = new Date();
         const seekAtTimeLocal = this.timeSyncCore.remoteDateToLocal(seekAtTime);
+        const expectedSequence = commandSequence ?? this.commandSequence;
 
         const callback = () => {
+            if (expectedSequence !== this.commandSequence) {
+                console.debug('SyncPlay scheduleSeek: command superseded, skipping seek.');
+                return;
+            }
+
             this.localUnpause();
             this.localSeek(positionTicks);
 
             Helper.waitForEventOnce(this.manager, 'ready', Helper.WaitForEventDefaultTimeout).then(() => {
+                if (expectedSequence !== this.commandSequence || this.lastCommand?.Command !== 'Seek') {
+                    console.debug('SyncPlay scheduleSeek: command superseded before pause.');
+                    return;
+                }
                 this.localPause();
                 this.sendBufferingRequest(false);
             }).catch((error) => {

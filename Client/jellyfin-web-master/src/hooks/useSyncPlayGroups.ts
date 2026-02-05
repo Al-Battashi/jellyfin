@@ -14,11 +14,22 @@ const fetchSyncPlayGroups = async (
     return response.data;
 };
 
-export const useSyncPlayGroups = () => {
+interface UseSyncPlayGroupsOptions {
+    enabled?: boolean
+    refetchInterval?: number | false
+}
+
+export const useSyncPlayGroups = (options: UseSyncPlayGroupsOptions = {}) => {
     const { api } = useApi();
+    const {
+        enabled = true,
+        refetchInterval = false
+    } = options;
+
     return useQuery({
         queryKey: [ 'SyncPlay', 'Groups' ],
         queryFn: ({ signal }) => fetchSyncPlayGroups(api!, { signal }),
-        enabled: !!api
+        enabled: !!api && enabled,
+        refetchInterval
     });
 };

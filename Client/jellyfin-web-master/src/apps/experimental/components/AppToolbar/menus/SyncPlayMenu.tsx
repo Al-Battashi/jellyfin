@@ -22,7 +22,8 @@ import { useApi } from 'hooks/useApi';
 import { useSyncPlayGroups } from 'hooks/useSyncPlayGroups';
 import globalize from 'lib/globalize';
 import { PluginType } from 'types/plugin';
-import Events, { Event } from 'utils/events';
+import { queryClient } from 'utils/query/queryClient';
+import Events from 'utils/events';
 
 export const ID = 'app-sync-play-menu';
 
@@ -38,9 +39,11 @@ interface SyncPlayInstance {
         isPlaylistEmpty: () => boolean
         haltGroupPlayback: (apiClient: ApiClient) => void
         resumeGroupPlayback: (apiClient: ApiClient) => void
+        enableSyncPlay: (apiClient: ApiClient, groupInfo: GroupInfoDto, showMessage: boolean) => void
     }
 }
 
+/* eslint-disable sonarjs/cognitive-complexity */
 const SyncPlayMenu: FC<SyncPlayMenuProps> = ({
     anchorEl,
     open,
@@ -55,23 +58,68 @@ const SyncPlayMenu: FC<SyncPlayMenuProps> = ({
         setSyncPlay(pluginManager.firstOfType(PluginType.SyncPlay)?.instance);
     }, []);
 
-    const { data: groups } = useSyncPlayGroups();
+    const updateSyncPlayGroup = useCallback(() => {
+        const group = syncPlay?.Manager.getGroupInfo() ?? undefined;
+        setCurrentGroup(group);
+    }, [ syncPlay ]);
 
-    const onGroupAddClick = useCallback(() => {
+    const enableSyncPlayGroup = useCallback((groupInfo?: GroupInfoDto) => {
+        if (!groupInfo?.GroupId || !syncPlay || !__legacyApiClient__) {
+            return false;
+        }
+
+        const normalizedGroupInfo = { ...groupInfo } as Record<string, unknown>;
+        normalizedGroupInfo.LastUpdatedAt = groupInfo.LastUpdatedAt ?
+            new Date(groupInfo.LastUpdatedAt) :
+            new Date();
+        syncPlay.Manager.enableSyncPlay(__legacyApiClient__, normalizedGroupInfo as GroupInfoDto, false);
+        setCurrentGroup(normalizedGroupInfo as GroupInfoDto);
+        return true;
+    }, [ __legacyApiClient__, syncPlay ]);
+
+    const fetchAndEnableSyncPlayGroup = useCallback(async (groupId?: string) => {
+        if (!groupId || !__legacyApiClient__) {
+            return false;
+        }
+
+        try {
+            const url = __legacyApiClient__.getUrl(`SyncPlay/${groupId}`, { _: Date.now() });
+            const groupInfo = await __legacyApiClient__.getJSON(url) as GroupInfoDto | undefined;
+            return enableSyncPlayGroup(groupInfo);
+        } catch (err) {
+            console.error('[SyncPlayMenu] failed to fetch SyncPlay group details', err);
+            return false;
+        }
+    }, [ __legacyApiClient__, enableSyncPlayGroup ]);
+
+    const { data: groups } = useSyncPlayGroups({
+        enabled: open && !isSyncPlayEnabled,
+        refetchInterval: open && !isSyncPlayEnabled ? 2000 : false
+    });
+
+    const onGroupAddClick = useCallback(async () => {
         if (api && user) {
-            getSyncPlayApi(api)
-                .syncPlayCreateGroup({
+            try {
+                const response = await getSyncPlayApi(api).syncPlayCreateGroup({
                     newGroupRequestDto: {
                         GroupName: globalize.translate('SyncPlayGroupDefaultTitle', user.Name)
                     }
-                })
-                .catch(err => {
-                    console.error('[SyncPlayMenu] failed to create a SyncPlay group', err);
                 });
+                const groupInfo = response?.data;
+                if (groupInfo?.GroupId) {
+                    enableSyncPlayGroup(groupInfo);
+                }
+            } catch (err) {
+                console.error('[SyncPlayMenu] failed to create a SyncPlay group', err);
+            } finally {
+                void queryClient.invalidateQueries({
+                    queryKey: [ 'SyncPlay', 'Groups' ]
+                });
+            }
 
             onMenuClose();
         }
-    }, [ api, onMenuClose, user ]);
+    }, [ api, enableSyncPlayGroup, onMenuClose, user ]);
 
     const onGroupLeaveClick = useCallback(() => {
         if (api) {
@@ -85,21 +133,26 @@ const SyncPlayMenu: FC<SyncPlayMenuProps> = ({
         }
     }, [ api, onMenuClose ]);
 
-    const onGroupJoinClick = useCallback((GroupId: string) => {
+    const onGroupJoinClick = useCallback(async (GroupId: string) => {
         if (api) {
-            getSyncPlayApi(api)
-                .syncPlayJoinGroup({
+            try {
+                await getSyncPlayApi(api).syncPlayJoinGroup({
                     joinGroupRequestDto: {
                         GroupId
                     }
-                })
-                .catch(err => {
-                    console.error('[SyncPlayMenu] failed to join SyncPlay group', err);
                 });
+                await fetchAndEnableSyncPlayGroup(GroupId);
+            } catch (err) {
+                console.error('[SyncPlayMenu] failed to join SyncPlay group', err);
+            } finally {
+                void queryClient.invalidateQueries({
+                    queryKey: [ 'SyncPlay', 'Groups' ]
+                });
+            }
 
             onMenuClose();
         }
-    }, [ api, onMenuClose ]);
+    }, [ api, fetchAndEnableSyncPlayGroup, onMenuClose ]);
 
     const onGroupSettingsClick = useCallback(async () => {
         if (!syncPlay) return;
@@ -136,23 +189,26 @@ const SyncPlayMenu: FC<SyncPlayMenuProps> = ({
         }
     }, [ __legacyApiClient__, onMenuClose, syncPlay ]);
 
-    const updateSyncPlayGroup = useCallback((_e: Event, enabled: boolean) => {
-        if (syncPlay && enabled) {
-            setCurrentGroup(syncPlay.Manager.getGroupInfo() ?? undefined);
-        } else {
-            setCurrentGroup(undefined);
-        }
-    }, [ syncPlay ]);
-
     useEffect(() => {
         if (!syncPlay) return;
 
+        updateSyncPlayGroup();
         Events.on(syncPlay.Manager, 'enabled', updateSyncPlayGroup);
+        Events.on(syncPlay.Manager, 'group-state-update', updateSyncPlayGroup);
+        Events.on(syncPlay.Manager, 'playerchange', updateSyncPlayGroup);
 
         return () => {
             Events.off(syncPlay.Manager, 'enabled', updateSyncPlayGroup);
+            Events.off(syncPlay.Manager, 'group-state-update', updateSyncPlayGroup);
+            Events.off(syncPlay.Manager, 'playerchange', updateSyncPlayGroup);
         };
     }, [ updateSyncPlayGroup, syncPlay ]);
+
+    useEffect(() => {
+        if (open) {
+            updateSyncPlayGroup();
+        }
+    }, [ open, updateSyncPlayGroup ]);
 
     const menuItems = [];
     if (isSyncPlayEnabled) {
@@ -295,5 +351,6 @@ const SyncPlayMenu: FC<SyncPlayMenuProps> = ({
         </Menu>
     );
 };
+/* eslint-enable sonarjs/cognitive-complexity */
 
 export default SyncPlayMenu;

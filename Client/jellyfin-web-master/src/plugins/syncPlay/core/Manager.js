@@ -37,6 +37,8 @@ class Manager {
         this.queuedCommand = null; // Queued playback command, applied when SyncPlay is ready.
         this.followingGroupPlayback = true; // Follow or ignore group playback.
         this.lastPlaybackCommand = null; // Last received playback command from server, tracks state of group.
+        this.pendingSnapshot = null; // Snapshot received before SyncPlay is enabled.
+        this.pendingResumePlayback = false; // Resume requested before queue became available.
 
         this.currentPlayer = null;
         this.playerWrapper = null;
@@ -190,8 +192,20 @@ class Manager {
     processGroupUpdate(cmd, apiClient) {
         switch (cmd.Type) {
             case 'PlayQueue':
-                this.queueCore.updatePlayQueue(apiClient, cmd.Data);
+                this.queueCore.updatePlayQueue(apiClient, cmd.Data).then(() => {
+                    this.attemptPendingResumePlayback(apiClient);
+                });
                 break;
+            case 'GroupSnapshot': {
+                const snapshot = cmd.Data;
+                if (!this.isSyncPlayEnabled()) {
+                    this.pendingSnapshot = snapshot;
+                    break;
+                }
+
+                this.applySnapshot(snapshot, apiClient);
+                break;
+            }
             case 'UserJoined':
 
                 toast(globalize.translate('MessageSyncPlayUserJoined', cmd.Data));
@@ -216,13 +230,20 @@ class Manager {
                 break;
             case 'NotInGroup':
             case 'GroupLeft':
-                this.disableSyncPlay(true);
+                this.rehydrateGroup(apiClient).then((rehydrated) => {
+                    if (!rehydrated) {
+                        this.disableSyncPlay(true);
+                    }
+                });
                 break;
             case 'GroupUpdate':
                 cmd.Data.LastUpdatedAt = new Date(cmd.Data.LastUpdatedAt);
                 this.groupInfo = cmd.Data;
                 break;
             case 'StateUpdate':
+                if (this.groupInfo) {
+                    this.groupInfo.State = cmd.Data.State;
+                }
                 Events.trigger(this, 'group-state-update', [cmd.Data.State, cmd.Data.Reason]);
                 console.debug(`SyncPlay processGroupUpdate: state changed to ${cmd.Data.State} because ${cmd.Data.Reason}.`);
                 break;
@@ -250,12 +271,7 @@ class Manager {
      */
     processCommand(cmd) {
         if (cmd === null) return;
-
-        if (typeof cmd.When === 'string') {
-            cmd.When = new Date(cmd.When);
-            cmd.EmittedAt = new Date(cmd.EmittedAt);
-            cmd.PositionTicks = cmd.PositionTicks ? parseInt(cmd.PositionTicks, 10) : null;
-        }
+        cmd = this.normalizeCommand(cmd);
 
         if (!this.isSyncPlayEnabled()) {
             console.debug('SyncPlay processCommand: SyncPlay not enabled, ignoring command.', cmd);
@@ -293,6 +309,48 @@ class Manager {
     }
 
     /**
+     * Normalizes a command coming from the server.
+     * @param {Object} cmd The command.
+     * @returns {Object} The normalized command.
+     */
+    normalizeCommand(cmd) {
+        if (cmd && typeof cmd.When === 'string') {
+            cmd.When = new Date(cmd.When);
+            cmd.EmittedAt = new Date(cmd.EmittedAt);
+            cmd.PositionTicks = cmd.PositionTicks ? parseInt(cmd.PositionTicks, 10) : null;
+        }
+
+        return cmd;
+    }
+
+    /**
+     * Applies a group snapshot without triggering playback actions.
+     * @param {Object} snapshot The snapshot data.
+     * @param {Object} apiClient The ApiClient.
+     */
+    applySnapshot(snapshot, apiClient) {
+        snapshot.GroupInfo.LastUpdatedAt = new Date(snapshot.GroupInfo.LastUpdatedAt);
+        this.groupInfo = snapshot.GroupInfo;
+
+        const updatePromise = this.queueCore.updatePlayQueue(apiClient, snapshot.PlayQueue);
+
+        if (!this.isIdleState(snapshot.GroupInfo.State)) {
+            Promise.resolve(updatePromise).then(() => {
+                if (this.isFollowingGroupPlayback()) {
+                    this.resumeGroupPlayback(apiClient);
+                }
+            });
+        }
+
+        if (snapshot.PlayingCommand) {
+            const playingCommand = this.normalizeCommand(snapshot.PlayingCommand);
+            if (playingCommand.Command === 'Unpause') {
+                this.lastPlaybackCommand = playingCommand;
+            }
+        }
+    }
+
+    /**
      * Handles a group state change.
      * @param {Object|null} update The group state update.
      */
@@ -326,6 +384,12 @@ class Manager {
      */
     resumeGroupPlayback(apiClient) {
         this.followGroupPlayback(apiClient).then(() => {
+            if (this.queueCore.isPlaylistEmpty()) {
+                this.pendingResumePlayback = true;
+                return;
+            }
+
+            this.pendingResumePlayback = false;
             this.queueCore.startPlayback(apiClient);
         });
     }
@@ -336,6 +400,7 @@ class Manager {
      */
     haltGroupPlayback(apiClient) {
         this.followingGroupPlayback = false;
+        this.pendingResumePlayback = false;
 
         apiClient.requestSyncPlaySetIgnoreWait({
             IgnoreWait: true
@@ -360,7 +425,17 @@ class Manager {
     enableSyncPlay(apiClient, groupInfo, showMessage = false) {
         if (this.isSyncPlayEnabled()) {
             if (groupInfo.GroupId === this.groupInfo.GroupId) {
-                console.debug(`SyncPlay enableSyncPlay: group ${this.groupInfo.GroupId} already joined.`);
+                console.debug(`SyncPlay enableSyncPlay: group ${this.groupInfo.GroupId} already joined, refreshing state.`);
+                this.groupInfo = groupInfo;
+                this.syncPlayEnabledAt = groupInfo.LastUpdatedAt;
+
+                if (this.pendingSnapshot && this.pendingSnapshot.GroupInfo?.GroupId === groupInfo.GroupId) {
+                    this.applySnapshot(this.pendingSnapshot, apiClient);
+                    this.pendingSnapshot = null;
+                } else if (!this.isIdleState(groupInfo.State) && this.isFollowingGroupPlayback() && !this.isPlaybackActive()) {
+                    // Allow same-group refreshes to re-trigger playback after UI-initiated joins.
+                    this.resumeGroupPlayback(apiClient);
+                }
                 return;
             } else {
                 console.warn(`SyncPlay enableSyncPlay: switching from group ${this.groupInfo.GroupId} to group ${groupInfo.GroupId}.`);
@@ -370,7 +445,9 @@ class Manager {
             showMessage = false;
         }
 
+        this.queueCore.reset();
         this.groupInfo = groupInfo;
+        this.pendingResumePlayback = false;
 
         this.syncPlayEnabledAt = groupInfo.LastUpdatedAt;
         this.playerWrapper.bindToPlayer();
@@ -392,6 +469,13 @@ class Manager {
         if (showMessage) {
             toast(globalize.translate('MessageSyncPlayEnabled'));
         }
+
+        if (this.pendingSnapshot && this.pendingSnapshot.GroupInfo?.GroupId === groupInfo.GroupId) {
+            this.applySnapshot(this.pendingSnapshot, apiClient);
+            this.pendingSnapshot = null;
+        } else if (!this.isIdleState(groupInfo.State)) {
+            this.resumeGroupPlayback(apiClient);
+        }
     }
 
     /**
@@ -404,6 +488,9 @@ class Manager {
         this.followingGroupPlayback = true;
         this.lastPlaybackCommand = null;
         this.queuedCommand = null;
+        this.pendingResumePlayback = false;
+        this.groupInfo = null;
+        this.queueCore.reset();
         this.playbackCore.syncEnabled = false;
         Events.trigger(this, 'enabled', [false]);
         this.playerWrapper.unbindFromPlayer();
@@ -476,6 +563,69 @@ class Manager {
         } else {
             return this.lastPlaybackCommand.Command === 'Unpause';
         }
+    }
+
+    /**
+     * Starts playback when queue becomes available after a deferred resume request.
+     * @param {Object} apiClient The ApiClient.
+     */
+    attemptPendingResumePlayback(apiClient) {
+        if (!this.pendingResumePlayback) {
+            return;
+        }
+
+        if (this.queueCore.isPlaylistEmpty()) {
+            return;
+        }
+
+        this.pendingResumePlayback = false;
+        this.queueCore.startPlayback(apiClient);
+    }
+
+    /**
+     * Attempts to rehydrate SyncPlay state from the server when membership is unclear.
+     * @param {Object} apiClient The ApiClient.
+     * @returns {Promise<boolean>} True if SyncPlay was re-enabled.
+     */
+    async rehydrateGroup(apiClient) {
+        try {
+            if (!apiClient) {
+                return false;
+            }
+
+            const user = await apiClient.getCurrentUser();
+            const userName = user?.Name;
+            if (!userName) {
+                return false;
+            }
+
+            const url = apiClient.getUrl('SyncPlay/List', { _: Date.now() });
+            const groups = await apiClient.getJSON(url);
+            if (!Array.isArray(groups)) {
+                return false;
+            }
+
+            const match = groups.find((group) => Array.isArray(group.Participants) && group.Participants.includes(userName));
+            if (!match) {
+                return false;
+            }
+
+            match.LastUpdatedAt = new Date(match.LastUpdatedAt);
+            this.enableSyncPlay(apiClient, match, false);
+            return true;
+        } catch (error) {
+            console.debug('SyncPlay rehydrateGroup: failed', error);
+            return false;
+        }
+    }
+
+    /**
+     * Checks if a group state represents an idle group.
+     * @param {string|number|null|undefined} state The state value.
+     * @returns {boolean} _true_ if group is idle, _false_ otherwise.
+     */
+    isIdleState(state) {
+        return state === 'Idle' || state === 0 || state === '0' || state == null;
     }
 
     /**
