@@ -9,6 +9,7 @@ import { pluginManager } from '../../../components/pluginManager';
 import { ServerConnections } from 'lib/jellyfin-apiclient';
 import { PluginType } from '../../../types/plugin.ts';
 import Events from '../../../utils/events.ts';
+import { getSyncPlayV2Json, postSyncPlayV2 } from '../core/V2Api';
 
 import './groupSelectionMenu.scss';
 
@@ -50,8 +51,7 @@ class GroupSelectionMenu {
         const resolveResponse = (response) => (response && typeof response.json === 'function' ? response.json() : response);
         const getSyncPlayManager = () => this.SyncPlay?.Manager || pluginManager.firstOfType(PluginType.SyncPlay)?.instance?.Manager;
         const fetchGroups = () => {
-            const url = apiClient.getUrl('SyncPlay/List', { _: Date.now() });
-            return apiClient.getJSON(url).catch((error) => {
+            return getSyncPlayV2Json(apiClient, 'List', { _: Date.now() }).catch((error) => {
                 console.error('SyncPlay: error fetching groups list:', error);
                 return [];
             });
@@ -61,20 +61,15 @@ class GroupSelectionMenu {
                 return Promise.resolve(null);
             }
 
-            const v2Url = apiClient.getUrl(`SyncPlay/V2/${groupId}`, { _: Date.now() });
-            return apiClient.getJSON(v2Url).then((state) => {
+            return getSyncPlayV2Json(apiClient, groupId, { _: Date.now() }).then((state) => {
                 if (state?.Snapshot?.GroupInfo) {
                     return state.Snapshot.GroupInfo;
                 }
 
                 return null;
             }).catch((error) => {
-                console.debug('SyncPlay: v2 group state unavailable, falling back to v1 group details.', error);
-                const v1Url = apiClient.getUrl(`SyncPlay/${groupId}`, { _: Date.now() });
-                return apiClient.getJSON(v1Url).catch((fallbackError) => {
-                    console.error('SyncPlay: error fetching group details:', fallbackError);
-                    return null;
-                });
+                console.error('SyncPlay: error fetching v2 group details:', error);
+                return null;
             });
         };
         const buildMenuItems = (groups) => {
@@ -266,7 +261,7 @@ class GroupSelectionMenu {
 
                 if (id == 'new-group') {
                     const groupName = globalize.translate('SyncPlayGroupDefaultTitle', userName);
-                    apiClient.createSyncPlayGroup({
+                    postSyncPlayV2(apiClient, 'New', {
                         GroupName: groupName
                     }).then(resolveResponse)
                         .then((groupInfo) => {
@@ -292,7 +287,7 @@ class GroupSelectionMenu {
                             }
                         });
                 } else if (id) {
-                    apiClient.joinSyncPlayGroup({
+                    postSyncPlayV2(apiClient, 'Join', {
                         GroupId: id
                     }).then(() => fetchGroupById(id))
                         .then((groupInfo) => {
@@ -405,7 +400,7 @@ class GroupSelectionMenu {
             } else if (id == 'halt-playback') {
                 this.SyncPlay?.Manager.haltGroupPlayback(apiClient);
             } else if (id == 'leave-group') {
-                apiClient.leaveSyncPlayGroup();
+                postSyncPlayV2(apiClient, 'Leave');
             } else if (id == 'settings') {
                 new SyncPlaySettingsEditor(apiClient, this.SyncPlay?.Manager.getTimeSyncCore(), { groupInfo: groupInfo })
                     .embed()
@@ -444,8 +439,7 @@ class GroupSelectionMenu {
         const apiClient = ServerConnections.currentApiClient();
         const getSyncPlayManager = () => this.SyncPlay?.Manager || pluginManager.firstOfType(PluginType.SyncPlay)?.instance?.Manager;
         const fetchGroups = () => {
-            const url = apiClient.getUrl('SyncPlay/List', { _: Date.now() });
-            return apiClient.getJSON(url);
+            return getSyncPlayV2Json(apiClient, 'List', { _: Date.now() });
         };
         const selectGroupForUser = (groups, userName) => {
             if (!Array.isArray(groups) || !userName) {
@@ -472,6 +466,20 @@ class GroupSelectionMenu {
         ServerConnections.user(apiClient).then((user) => {
             const syncPlayManager = getSyncPlayManager();
             const userName = user?.localUser?.Name || user?.Name || '';
+            const localGroupInfo = syncPlayManager?.getGroupInfo?.();
+
+            if (syncPlayManager?.isSyncPlayEnabled?.() && localGroupInfo) {
+                if (syncPlayManager?.refreshJoinedGroupStateV2) {
+                    syncPlayManager.refreshJoinedGroupStateV2(apiClient, { allowEnable: true }).catch((error) => {
+                        console.debug('SyncPlay: background v2 rehydrate during menu open failed:', error);
+                        return false;
+                    });
+                }
+
+                this.showLeaveGroupSelection(button, user, apiClient);
+                return;
+            }
+
             let rehydratePromise = Promise.resolve(false);
             if (syncPlayManager?.refreshJoinedGroupStateV2) {
                 rehydratePromise = syncPlayManager.refreshJoinedGroupStateV2(apiClient, { allowEnable: true });
@@ -488,8 +496,8 @@ class GroupSelectionMenu {
                 }
 
                 fetchGroups().then((groups) => {
-                    const localGroupInfo = syncPlayManager?.getGroupInfo?.();
-                    const groupInfo = selectGroupForUser(groups, userName) || selectGroupById(groups, localGroupInfo?.GroupId);
+                    const fallbackGroupInfo = syncPlayManager?.getGroupInfo?.();
+                    const groupInfo = selectGroupForUser(groups, userName) || selectGroupById(groups, fallbackGroupInfo?.GroupId);
                     if (groupInfo && syncPlayManager) {
                         groupInfo.LastUpdatedAt = new Date(groupInfo.LastUpdatedAt);
                         syncPlayManager.enableSyncPlay(apiClient, groupInfo, false);
@@ -497,7 +505,7 @@ class GroupSelectionMenu {
                         return;
                     }
 
-                    if (syncPlayManager?.isSyncPlayEnabled?.() && localGroupInfo) {
+                    if (syncPlayManager?.isSyncPlayEnabled?.() && fallbackGroupInfo) {
                         this.showLeaveGroupSelection(button, user, apiClient);
                         return;
                     }
