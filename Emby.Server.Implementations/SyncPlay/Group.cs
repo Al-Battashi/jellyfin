@@ -293,8 +293,7 @@ namespace Emby.Server.Implementations.SyncPlay
 
             _state.SessionJoined(this, _state.Type, session, cancellationToken);
 
-            var snapshotUpdate = new SyncPlayGroupSnapshotUpdate(GroupId, BuildSnapshot());
-            SendGroupUpdate(session, SyncPlayBroadcastType.CurrentSession, snapshotUpdate, cancellationToken);
+            SendSnapshotUpdate(session, SyncPlayBroadcastType.AllGroup, cancellationToken);
 
             _logger.LogInformation("Session {SessionId} created group {GroupId}.", session.Id, GroupId.ToString());
         }
@@ -318,8 +317,7 @@ namespace Emby.Server.Implementations.SyncPlay
 
             _state.SessionJoined(this, _state.Type, session, cancellationToken);
 
-            var snapshotUpdate = new SyncPlayGroupSnapshotUpdate(GroupId, BuildSnapshot());
-            SendGroupUpdate(session, SyncPlayBroadcastType.CurrentSession, snapshotUpdate, cancellationToken);
+            SendSnapshotUpdate(session, SyncPlayBroadcastType.AllGroup, cancellationToken);
 
             _logger.LogInformation("Session {SessionId} joined group {GroupId}.", session.Id, GroupId.ToString());
         }
@@ -342,6 +340,8 @@ namespace Emby.Server.Implementations.SyncPlay
 
             var updateOthers = new SyncPlayUserLeftUpdate(GroupId, session.UserName);
             SendGroupUpdate(session, SyncPlayBroadcastType.AllExceptCurrentSession, updateOthers, cancellationToken);
+
+            SendSnapshotUpdate(session, SyncPlayBroadcastType.AllGroup, cancellationToken);
 
             _logger.LogInformation("Session {SessionId} left group {GroupId}.", session.Id, GroupId.ToString());
         }
@@ -368,7 +368,13 @@ namespace Emby.Server.Implementations.SyncPlay
             //      Once all clients report to be ready the group's state can change to Playing or Paused.
             // - Playing: clients have some media loaded and playback is unpaused.
             // - Paused: clients have some media loaded but playback is currently paused.
+            var previousRevision = Revision;
             request.Apply(this, _state, session, cancellationToken);
+
+            if (Revision != previousRevision)
+            {
+                SendSnapshotUpdate(session, SyncPlayBroadcastType.AllGroup, cancellationToken);
+            }
         }
 
         /// <summary>
@@ -387,21 +393,56 @@ namespace Emby.Server.Implementations.SyncPlay
         /// <returns>The V2 group state payload.</returns>
         public SyncPlayGroupStateV2Dto GetStateV2()
         {
-            return new SyncPlayGroupStateV2Dto(GroupId, Revision, BuildSnapshot(), DateTime.UtcNow);
+            return new SyncPlayGroupStateV2Dto(GroupId, Revision, BuildSnapshot(includeStatePlaybackCommand: true), DateTime.UtcNow);
         }
 
-        private SyncPlayGroupSnapshotDto BuildSnapshot()
+        /// <summary>
+        /// Sends an authoritative V2 snapshot update to selected sessions.
+        /// </summary>
+        /// <param name="from">The source session for broadcast filtering.</param>
+        /// <param name="type">The target sessions type.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <param name="playingCommand">Optional playback command to attach to the snapshot.</param>
+        /// <param name="includeStatePlaybackCommand">Whether to derive a state command when no explicit command is provided.</param>
+        public void SendSnapshotUpdate(
+            SessionInfo from,
+            SyncPlayBroadcastType type,
+            CancellationToken cancellationToken,
+            SendCommand playingCommand = null,
+            bool includeStatePlaybackCommand = false)
+        {
+            var snapshotUpdate = new SyncPlayGroupSnapshotUpdate(GroupId, BuildSnapshot(playingCommand, includeStatePlaybackCommand));
+            SendGroupUpdate(from, type, snapshotUpdate, cancellationToken);
+        }
+
+        private SyncPlayGroupSnapshotDto BuildSnapshot(SendCommand playingCommand = null, bool includeStatePlaybackCommand = false)
         {
             var groupInfo = GetInfo();
             var playQueueUpdate = GetPlayQueueUpdate(PlayQueueUpdateReason.NewPlaylist);
 
-            SendCommand playingCommand = null;
-            if (_state.Type == GroupStateType.Playing)
+            // When no explicit command is provided we optionally derive one from current state.
+            // This lets clients reconstruct paused/playing intent after reconnect without requiring
+            // an immediate transport command message.
+            if (playingCommand is null && includeStatePlaybackCommand)
             {
-                playingCommand = NewSyncPlayCommand(SendCommandType.Unpause);
+                if (_state.Type == GroupStateType.Playing)
+                {
+                    playingCommand = NewSyncPlayCommand(SendCommandType.Unpause);
+                }
+                else if (_state.Type == GroupStateType.Paused || _state.Type == GroupStateType.Waiting)
+                {
+                    playingCommand = NewSyncPlayCommand(SendCommandType.Pause);
+                }
             }
 
             return new SyncPlayGroupSnapshotDto(groupInfo, playQueueUpdate, playingCommand, Revision, DateTime.UtcNow);
+        }
+
+        private static bool IsLegacyPlaybackUpdate(GroupUpdateType type)
+        {
+            return type == GroupUpdateType.GroupUpdate
+                || type == GroupUpdateType.PlayQueue
+                || type == GroupUpdateType.StateUpdate;
         }
 
         /// <summary>
@@ -441,6 +482,15 @@ namespace Emby.Server.Implementations.SyncPlay
         /// <inheritdoc />
         public Task SendGroupUpdate<T>(SessionInfo from, SyncPlayBroadcastType type, GroupUpdate<T> message, CancellationToken cancellationToken)
         {
+            // Legacy clients still expect old update types, but V2 clients reconcile from snapshots.
+            // Convert legacy playback updates into snapshot updates so all consumers see one
+            // authoritative shape and revision progression.
+            if (message.Type != GroupUpdateType.GroupSnapshot && IsLegacyPlaybackUpdate(message.Type))
+            {
+                var snapshotUpdate = new SyncPlayGroupSnapshotUpdate(GroupId, BuildSnapshot());
+                return SendGroupUpdate(from, type, snapshotUpdate, cancellationToken);
+            }
+
             IEnumerable<Task> GetTasks()
             {
                 foreach (var sessionId in FilterSessions(from.Id, type))
@@ -455,15 +505,10 @@ namespace Emby.Server.Implementations.SyncPlay
         /// <inheritdoc />
         public Task SendCommand(SessionInfo from, SyncPlayBroadcastType type, SendCommand message, CancellationToken cancellationToken)
         {
-            IEnumerable<Task> GetTasks()
-            {
-                foreach (var sessionId in FilterSessions(from.Id, type))
-                {
-                    yield return _sessionManager.SendSyncPlayCommand(sessionId, message, cancellationToken);
-                }
-            }
-
-            return Task.WhenAll(GetTasks());
+            // Transport commands mutate observed playback intent and therefore advance revision.
+            TouchRevision();
+            var snapshotUpdate = new SyncPlayGroupSnapshotUpdate(GroupId, BuildSnapshot(message));
+            return SendGroupUpdate(from, type, snapshotUpdate, cancellationToken);
         }
 
         /// <inheritdoc />
@@ -578,6 +623,7 @@ namespace Emby.Server.Implementations.SyncPlay
             RunTimeTicks = item.RunTimeTicks ?? 0;
             PositionTicks = startPositionTicks;
             LastActivity = DateTime.UtcNow;
+            // Queue replacement is a hard state boundary for clients, always revisioned.
             TouchRevision();
 
             return true;
@@ -693,6 +739,7 @@ namespace Emby.Server.Implementations.SyncPlay
         {
             PositionTicks = 0;
             LastActivity = DateTime.UtcNow;
+            // Resetting item position changes derived playback time for all clients.
             TouchRevision();
         }
 

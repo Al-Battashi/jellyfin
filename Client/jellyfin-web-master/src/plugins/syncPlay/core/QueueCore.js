@@ -6,6 +6,7 @@
 import globalize from '../../../lib/globalize';
 import toast from '../../../components/toast/toast';
 import * as Helper from './Helper';
+import { postSyncPlayV2 } from './V2Api';
 
 /**
  * Class that manages the queue of SyncPlay.
@@ -207,7 +208,7 @@ class QueueCore {
             const currentPositionTicks = Math.round(currentPosition * Helper.TicksPerMillisecond);
             const isPlaying = playerWrapper.isPlaying();
 
-            apiClient.requestSyncPlayReady({
+            postSyncPlayV2(apiClient, 'Ready', {
                 When: now.toISOString(),
                 PositionTicks: currentPositionTicks,
                 IsPlaying: isPlaying,

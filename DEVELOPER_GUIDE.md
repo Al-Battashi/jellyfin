@@ -55,6 +55,12 @@ Paths are relative to the repo root.
 - `SharedVersion.cs` – Shared assembly version used across projects.
 - `stylecop.json` and `BannedSymbols.txt` – Code style and banned API configuration.
 
+## SyncPlay Documentation
+
+For a detailed SyncPlay implementation map (client + server), see:
+
+- `docs/syncplay/README.md` – architecture, state/revision model, file-by-file responsibilities, and troubleshooting/test checklist.
+
 ## Prerequisites
 
 - **.NET SDK**: `10.0.0` (from `global.json`).
