@@ -267,6 +267,12 @@ dist
 *.exe
 *.dll
 
+# Rust native interop artifacts
+native/jellyfin-native/target/
+src/Jellyfin.NativeInterop/runtimes/**/native/*.so
+src/Jellyfin.NativeInterop/runtimes/**/native/*.dylib
+src/Jellyfin.NativeInterop/runtimes/**/native/*.dll
+
 # BenchmarkDotNet artifacts
 BenchmarkDotNet.Artifacts
 

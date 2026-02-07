@@ -16,6 +16,7 @@ using Jellyfin.Data.Enums;
 using Jellyfin.Extensions;
 using Jellyfin.Extensions.Json;
 using Jellyfin.Extensions.Json.Converters;
+using Jellyfin.NativeInterop;
 using MediaBrowser.Common;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Common.Extensions;
@@ -58,6 +59,7 @@ namespace MediaBrowser.MediaEncoding.Encoder
         private readonly IBlurayExaminer _blurayExaminer;
         private readonly IConfiguration _config;
         private readonly IServerConfigurationManager _serverConfig;
+        private readonly INativeProbeNormalizer _nativeProbeNormalizer;
         private readonly string _startupOptionFFmpegPath;
 
         private readonly AsyncNonKeyedLocker _thumbnailResourcePool;
@@ -112,7 +114,8 @@ namespace MediaBrowser.MediaEncoding.Encoder
             IBlurayExaminer blurayExaminer,
             ILocalizationManager localization,
             IConfiguration config,
-            IServerConfigurationManager serverConfig)
+            IServerConfigurationManager serverConfig,
+            INativeProbeNormalizer nativeProbeNormalizer = null)
         {
             _logger = logger;
             _configurationManager = configurationManager;
@@ -121,6 +124,7 @@ namespace MediaBrowser.MediaEncoding.Encoder
             _localization = localization;
             _config = config;
             _serverConfig = serverConfig;
+            _nativeProbeNormalizer = nativeProbeNormalizer ?? NativeInteropFacade.ProbeNormalizer;
             _startupOptionFFmpegPath = config.GetValue<string>(Controller.Extensions.ConfigurationExtensions.FfmpegPathKey) ?? string.Empty;
 
             _jsonSerializerOptions = new JsonSerializerOptions(JsonDefaults.Options);
@@ -546,14 +550,16 @@ namespace MediaBrowser.MediaEncoding.Encoder
                 StartProcess(processWrapper);
                 using var reader = process.StandardOutput;
                 await reader.BaseStream.CopyToAsync(memoryStream, cancellationToken).ConfigureAwait(false);
-                memoryStream.Seek(0, SeekOrigin.Begin);
+                var ffprobePayload = memoryStream.ToArray();
                 InternalMediaInfoResult result;
                 try
                 {
-                    result = await JsonSerializer.DeserializeAsync<InternalMediaInfoResult>(
-                                        memoryStream,
-                                        _jsonSerializerOptions,
-                                        cancellationToken).ConfigureAwait(false);
+                    result = DeserializeMediaInfo(ffprobePayload);
+
+                    if (result is null)
+                    {
+                        throw new FfmpegException("Failed to deserialize ffprobe result.");
+                    }
                 }
                 catch
                 {
@@ -562,29 +568,57 @@ namespace MediaBrowser.MediaEncoding.Encoder
                     throw;
                 }
 
-                if (result is null || (result.Streams is null && result.Format is null))
+                if (result.Streams is null && result.Format is null)
                 {
                     throw new FfmpegException("ffprobe failed - streams and format are both null.");
                 }
 
-                if (result.Streams is not null)
-                {
-                    // Normalize aspect ratio if invalid
-                    foreach (var stream in result.Streams)
-                    {
-                        if (string.Equals(stream.DisplayAspectRatio, "0:1", StringComparison.OrdinalIgnoreCase))
-                        {
-                            stream.DisplayAspectRatio = string.Empty;
-                        }
-
-                        if (string.Equals(stream.SampleAspectRatio, "0:1", StringComparison.OrdinalIgnoreCase))
-                        {
-                            stream.SampleAspectRatio = string.Empty;
-                        }
-                    }
-                }
+                NormalizeInvalidAspectRatios(result);
 
                 return new ProbeResultNormalizer(_logger, _localization).GetMediaInfo(result, videoType, isAudio, primaryPath, protocol);
+            }
+        }
+
+        private InternalMediaInfoResult DeserializeMediaInfo(byte[] ffprobePayload)
+        {
+            string nativeError = string.Empty;
+            if (_nativeProbeNormalizer.Mode != NativeInteropMode.Disabled && _nativeProbeNormalizer.TryNormalize(ffprobePayload, out var normalizedPayload, out nativeError))
+            {
+                return JsonSerializer.Deserialize<InternalMediaInfoResult>(normalizedPayload, _jsonSerializerOptions);
+            }
+
+            if (_nativeProbeNormalizer.Mode == NativeInteropMode.Required)
+            {
+                var reason = string.IsNullOrWhiteSpace(nativeError) ? "unknown native error" : nativeError;
+                throw new FfmpegException($"Native ffprobe normalization failed in required mode: {reason}");
+            }
+
+            if (_nativeProbeNormalizer.Mode == NativeInteropMode.Prefer && !string.IsNullOrWhiteSpace(nativeError))
+            {
+                _logger.LogWarning("Native ffprobe normalization unavailable; falling back to managed path: {Reason}", nativeError);
+            }
+
+            return JsonSerializer.Deserialize<InternalMediaInfoResult>(ffprobePayload, _jsonSerializerOptions);
+        }
+
+        private static void NormalizeInvalidAspectRatios(InternalMediaInfoResult result)
+        {
+            if (result.Streams is null)
+            {
+                return;
+            }
+
+            foreach (var stream in result.Streams)
+            {
+                if (string.Equals(stream.DisplayAspectRatio, "0:1", StringComparison.OrdinalIgnoreCase))
+                {
+                    stream.DisplayAspectRatio = string.Empty;
+                }
+
+                if (string.Equals(stream.SampleAspectRatio, "0:1", StringComparison.OrdinalIgnoreCase))
+                {
+                    stream.SampleAspectRatio = string.Empty;
+                }
             }
         }
 

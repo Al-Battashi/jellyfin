@@ -1,0 +1,13 @@
+[package]
+name = "jf_native_abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+jf_native_core = { path = "../jf_native_core" }
+serde_json.workspace = true

@@ -26,6 +26,13 @@ jobs:
         with:
           dotnet-version: ${{ env.SDK_VERSION }}
 
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native interop runtime
+        shell: bash
+        run: ./native/jellyfin-native/scripts/build-native-interop.sh
+
       - name: Run DotNet CLI Tests
         run: >
           dotnet test Jellyfin.sln

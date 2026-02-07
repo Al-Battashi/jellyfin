@@ -21,6 +21,13 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native interop runtime
+        run: |
+          ./native/jellyfin-native/scripts/build-native-interop.sh
+
       - name: Build
         run: |
           dotnet build Jellyfin.Server -o ./out
@@ -51,6 +58,9 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Checkout common ancestor
         env:
           HEAD_REF: ${{ github.head_ref }}
@@ -59,6 +69,10 @@ jobs:
           git -c protocol.version=2 fetch --prune --progress --no-recurse-submodules upstream +refs/heads/*:refs/remotes/upstream/* +refs/tags/*:refs/tags/*
           ANCESTOR_REF=$(git merge-base upstream/${{ github.base_ref }} origin/$HEAD_REF)
           git checkout --progress --force $ANCESTOR_REF
+
+      - name: Build native interop runtime
+        run: |
+          ./native/jellyfin-native/scripts/build-native-interop.sh
 
       - name: Build
         run: |

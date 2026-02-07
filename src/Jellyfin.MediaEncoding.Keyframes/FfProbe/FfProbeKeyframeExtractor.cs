@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using Jellyfin.NativeInterop;
 
 namespace Jellyfin.MediaEncoding.Keyframes.FfProbe;
 
@@ -74,58 +75,78 @@ public static class FfProbeKeyframeExtractor
 
     internal static KeyframeData ParseStream(StreamReader reader)
     {
+        using (reader)
+        {
+            var input = reader.ReadToEnd();
+            var parser = NativeInteropFacade.KeyframeParser;
+
+            if (parser.Mode != NativeInteropMode.Disabled && parser.TryParse(input, out var nativeResult, out _))
+            {
+                return new KeyframeData(nativeResult.TotalDurationTicks, nativeResult.KeyframeTicks);
+            }
+
+            if (parser.Mode == NativeInteropMode.Required)
+            {
+                throw new InvalidOperationException("Native keyframe parsing failed while JELLYFIN_NATIVE_MODE=required.");
+            }
+
+            return ParseStreamManaged(input);
+        }
+    }
+
+    private static KeyframeData ParseStreamManaged(string input)
+    {
         var keyframes = new List<long>();
         double streamDuration = 0;
         double formatDuration = 0;
 
-        using (reader)
+        using var lineReader = new StringReader(input);
+        string? line;
+        while ((line = lineReader.ReadLine()) is not null)
         {
-            while (!reader.EndOfStream)
+            var lineSpan = line.AsSpan();
+            if (lineSpan.IsEmpty)
             {
-                var line = reader.ReadLine().AsSpan();
-                if (line.IsEmpty)
-                {
-                    continue;
-                }
+                continue;
+            }
 
-                var firstComma = line.IndexOf(',');
-                var lineType = line[..firstComma];
-                var rest = line[(firstComma + 1)..];
-                if (lineType.Equals("packet", StringComparison.OrdinalIgnoreCase))
+            var firstComma = lineSpan.IndexOf(',');
+            var lineType = lineSpan[..firstComma];
+            var rest = lineSpan[(firstComma + 1)..];
+            if (lineType.Equals("packet", StringComparison.OrdinalIgnoreCase))
+            {
+                // Split time and flags from the packet line. Example line: packet,7169.079000,K_
+                var secondComma = rest.IndexOf(',');
+                var ptsTime = rest[..secondComma];
+                var flags = rest[(secondComma + 1)..];
+                if (flags.StartsWith("K_"))
                 {
-                    // Split time and flags from the packet line. Example line: packet,7169.079000,K_
-                    var secondComma = rest.IndexOf(',');
-                    var ptsTime = rest[..secondComma];
-                    var flags = rest[(secondComma + 1)..];
-                    if (flags.StartsWith("K_"))
+                    if (double.TryParse(ptsTime, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var keyframe))
                     {
-                        if (double.TryParse(ptsTime, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var keyframe))
-                        {
-                            // Have to manually convert to ticks to avoid rounding errors as TimeSpan is only precise down to 1 ms when converting double.
-                            keyframes.Add(Convert.ToInt64(keyframe * TimeSpan.TicksPerSecond));
-                        }
-                    }
-                }
-                else if (lineType.Equals("stream", StringComparison.OrdinalIgnoreCase))
-                {
-                    if (double.TryParse(rest, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var streamDurationResult))
-                    {
-                        streamDuration = streamDurationResult;
-                    }
-                }
-                else if (lineType.Equals("format", StringComparison.OrdinalIgnoreCase))
-                {
-                    if (double.TryParse(rest, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var formatDurationResult))
-                    {
-                        formatDuration = formatDurationResult;
+                        // Have to manually convert to ticks to avoid rounding errors as TimeSpan is only precise down to 1 ms when converting double.
+                        keyframes.Add(Convert.ToInt64(keyframe * TimeSpan.TicksPerSecond));
                     }
                 }
             }
-
-            // Prefer the stream duration as it should be more accurate
-            var duration = streamDuration > 0 ? streamDuration : formatDuration;
-
-            return new KeyframeData(TimeSpan.FromSeconds(duration).Ticks, keyframes);
+            else if (lineType.Equals("stream", StringComparison.OrdinalIgnoreCase))
+            {
+                if (double.TryParse(rest, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var streamDurationResult))
+                {
+                    streamDuration = streamDurationResult;
+                }
+            }
+            else if (lineType.Equals("format", StringComparison.OrdinalIgnoreCase))
+            {
+                if (double.TryParse(rest, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var formatDurationResult))
+                {
+                    formatDuration = formatDurationResult;
+                }
+            }
         }
+
+        // Prefer the stream duration as it should be more accurate
+        var duration = streamDuration > 0 ? streamDuration : formatDuration;
+
+        return new KeyframeData(TimeSpan.FromSeconds(duration).Ticks, keyframes);
     }
 }

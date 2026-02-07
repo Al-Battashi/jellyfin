@@ -8,6 +8,7 @@ using Jellyfin.Database.Implementations;
 using Jellyfin.Drawing;
 using Jellyfin.Drawing.Skia;
 using Jellyfin.LiveTv;
+using Jellyfin.NativeInterop;
 using Jellyfin.Server.Implementations.Activity;
 using Jellyfin.Server.Implementations.Devices;
 using Jellyfin.Server.Implementations.Events;
@@ -87,6 +88,10 @@ namespace Jellyfin.Server
             serviceCollection.AddSingleton<IDisplayPreferencesManager, DisplayPreferencesManager>();
             serviceCollection.AddSingleton<IDeviceManager, DeviceManager>();
             serviceCollection.AddSingleton<ITrickplayManager, TrickplayManager>();
+            serviceCollection.AddSingleton<NativeInteropRuntime>();
+            serviceCollection.AddSingleton<INativeInteropRuntime>(serviceProvider => serviceProvider.GetRequiredService<NativeInteropRuntime>());
+            serviceCollection.AddSingleton<INativeProbeNormalizer>(serviceProvider => serviceProvider.GetRequiredService<NativeInteropRuntime>());
+            serviceCollection.AddSingleton<INativeKeyframeParser>(serviceProvider => serviceProvider.GetRequiredService<NativeInteropRuntime>());
 
             // TODO search the assemblies instead of adding them manually?
             serviceCollection.AddSingleton<IWebSocketListener, SessionWebSocketListener>();

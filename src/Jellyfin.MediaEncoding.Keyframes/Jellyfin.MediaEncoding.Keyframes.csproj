@@ -23,6 +23,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\Jellyfin.NativeInterop\Jellyfin.NativeInterop.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
       <_Parameter1>Jellyfin.MediaEncoding.Keyframes.Tests</_Parameter1>
     </AssemblyAttribute>
