@@ -27,6 +27,7 @@ namespace Emby.Server.Implementations.Library.Resolvers.Movies
     /// </summary>
     public partial class MovieResolver : BaseVideoResolver<Video>, IMultiItemResolver
     {
+        private const string _plexVersionsFolderName = "Plex Versions";
         private readonly IImageProcessor _imageProcessor;
 
         private static readonly CollectionType[] _validCollectionTypes = new[]
@@ -396,6 +397,7 @@ namespace Emby.Server.Implementations.Library.Resolvers.Movies
             where T : Video, new()
         {
             var multiDiscFolders = new List<FileSystemMetadata>();
+            var plexVersionsFolders = new List<FileSystemMetadata>();
 
             var libraryOptions = args.LibraryOptions;
             var supportPhotos = collectionType == CollectionType.homevideos && libraryOptions.EnablePhotos;
@@ -408,6 +410,12 @@ namespace Emby.Server.Implementations.Library.Resolvers.Movies
 
                 if (child.IsDirectory)
                 {
+                    if (IsPlexVersionsFolder(child))
+                    {
+                        plexVersionsFolders.Add(child);
+                        continue;
+                    }
+
                     if (NamingOptions.AllExtrasTypesFolderNames.ContainsKey(filename))
                     {
                         continue;
@@ -455,8 +463,9 @@ namespace Emby.Server.Implementations.Library.Resolvers.Movies
 
             // TODO: Allow GetMultiDiscMovie in here
             const bool SupportsMultiVersion = true;
+            var entriesForMovieResolution = fileSystemEntries.Where(i => !IsPlexVersionsFolder(i)).ToList();
 
-            var result = ResolveVideos<T>(parent, fileSystemEntries, SupportsMultiVersion, collectionType, parseName) ??
+            var result = ResolveVideos<T>(parent, entriesForMovieResolution, SupportsMultiVersion, collectionType, parseName) ??
                 new MultiItemResolverResult();
 
             var isPhotosCollection = collectionType == CollectionType.homevideos || collectionType == CollectionType.photos;
@@ -470,6 +479,18 @@ namespace Emby.Server.Implementations.Library.Resolvers.Movies
                 {
                     var movie = (T)result.Items[0];
                     movie.IsInMixedFolder = false;
+                    if ((collectionType == CollectionType.movies || collectionType is null) && movie is Movie && plexVersionsFolders.Count > 0)
+                    {
+                        var plexVersionAlternates = GetPlexVersionAlternates(movie, plexVersionsFolders, parseName, parent);
+                        if (plexVersionAlternates.Length > 0)
+                        {
+                            movie.LocalAlternateVersions = movie.LocalAlternateVersions
+                                .Concat(plexVersionAlternates)
+                                .Distinct(StringComparer.OrdinalIgnoreCase)
+                                .ToArray();
+                        }
+                    }
+
                     if (collectionType == CollectionType.movies || collectionType is null)
                     {
                         movie.Name = Path.GetFileName(movie.ContainingFolderPath);
@@ -485,6 +506,100 @@ namespace Emby.Server.Implementations.Library.Resolvers.Movies
 
             return null;
         }
+
+        private string[] GetPlexVersionAlternates(Video movie, IReadOnlyList<FileSystemMetadata> plexVersionsFolders, bool parseName, Folder parent)
+        {
+            if (parent is null)
+            {
+                return Array.Empty<string>();
+            }
+
+            var primaryInfo = VideoResolver.Resolve(movie.Path, false, NamingOptions, parseName, parent.ContainingFolderPath);
+            if (primaryInfo is null || primaryInfo.ExtraType is not null)
+            {
+                return Array.Empty<string>();
+            }
+
+            var alternatePaths = new List<string>();
+            var candidates = GetPlexVersionVideoCandidates(plexVersionsFolders);
+            foreach (var candidate in candidates)
+            {
+                var candidateInfo = VideoResolver.Resolve(candidate.FullName, false, NamingOptions, parseName, parent.ContainingFolderPath);
+                if (candidateInfo is null || candidateInfo.ExtraType is not null)
+                {
+                    continue;
+                }
+
+                if (IsMatchingPlexAlternate(primaryInfo, candidateInfo))
+                {
+                    alternatePaths.Add(candidate.FullName);
+                }
+            }
+
+            return alternatePaths
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+
+        private List<FileSystemMetadata> GetPlexVersionVideoCandidates(IReadOnlyList<FileSystemMetadata> plexVersionsFolders)
+        {
+            var result = new List<FileSystemMetadata>();
+            var toVisit = new Stack<FileSystemMetadata>(plexVersionsFolders);
+
+            while (toVisit.Count > 0)
+            {
+                var current = toVisit.Pop();
+                var children = DirectoryService.GetFileSystemEntries(current.FullName);
+
+                foreach (var child in children)
+                {
+                    if (child.IsDirectory)
+                    {
+                        toVisit.Push(child);
+                        continue;
+                    }
+
+                    if (IsIgnoredRegex().IsMatch(child.Name))
+                    {
+                        continue;
+                    }
+
+                    if (VideoResolver.IsVideoFile(child.FullName, NamingOptions))
+                    {
+                        result.Add(child);
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private static bool IsMatchingPlexAlternate(VideoFileInfo primaryInfo, VideoFileInfo candidateInfo)
+        {
+            if (string.Equals(primaryInfo.Path, candidateInfo.Path, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            if (!string.Equals(primaryInfo.Name, candidateInfo.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            // If both files have a known year, it must match.
+            if (primaryInfo.Year.HasValue && candidateInfo.Year.HasValue && primaryInfo.Year != candidateInfo.Year)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool IsPlexVersionsFolder(FileSystemMetadata fileSystemEntry)
+            => fileSystemEntry.IsDirectory && IsPlexVersionsFolder(fileSystemEntry.Name);
+
+        private static bool IsPlexVersionsFolder(string folderName)
+            => string.Equals(folderName, _plexVersionsFolderName, StringComparison.OrdinalIgnoreCase);
 
         /// <summary>
         /// Gets the multi disc movie.

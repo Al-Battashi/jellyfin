@@ -353,47 +353,83 @@ public class MediaInfoHelper
     /// <param name="maxBitrate">Max bitrate.</param>
     public void SortMediaSources(PlaybackInfoResponse result, long? maxBitrate)
     {
-        var originalList = result.MediaSources.ToList();
+        var effectiveMaxBitrate = GetEffectiveMaxBitrate(result, maxBitrate);
 
-        result.MediaSources = result.MediaSources.OrderBy(i =>
+        result.MediaSources = result.MediaSources
+            .Select((mediaSource, index) => new
             {
-                // Nothing beats direct playing a file
-                if (i.SupportsDirectPlay && i.Protocol == MediaProtocol.File)
-                {
-                    return 0;
-                }
-
-                return 1;
+                MediaSource = mediaSource,
+                Index = index,
+                CapabilityTier = GetCapabilityTier(mediaSource),
+                BitrateBucket = GetBitrateBucket(mediaSource, effectiveMaxBitrate),
+                BitrateOvershoot = GetBitrateOvershoot(mediaSource, effectiveMaxBitrate),
+                Width = mediaSource.VideoStream?.Width ?? 0,
+                Height = mediaSource.VideoStream?.Height ?? 0,
+                Bitrate = mediaSource.Bitrate ?? 0
             })
-            .ThenBy(i =>
-            {
-                // Let's assume direct streaming a file is just as desirable as direct playing a remote url
-                if (i.SupportsDirectPlay || i.SupportsDirectStream)
-                {
-                    return 0;
-                }
-
-                return 1;
-            })
-            .ThenBy(i =>
-            {
-                return i.Protocol switch
-                {
-                    MediaProtocol.File => 0,
-                    _ => 1,
-                };
-            })
-            .ThenBy(i =>
-            {
-                if (maxBitrate.HasValue && i.Bitrate.HasValue)
-                {
-                    return i.Bitrate.Value <= maxBitrate.Value ? 0 : 2;
-                }
-
-                return 1;
-            })
-            .ThenBy(originalList.IndexOf)
+            .OrderBy(i => i.CapabilityTier)
+            .ThenBy(i => i.BitrateBucket)
+            .ThenBy(i => i.BitrateOvershoot)
+            .ThenByDescending(i => i.Width)
+            .ThenByDescending(i => i.Height)
+            .ThenByDescending(i => i.Bitrate)
+            .ThenBy(i => i.Index)
+            .Select(i => i.MediaSource)
             .ToArray();
+    }
+
+    private static long? GetEffectiveMaxBitrate(PlaybackInfoResponse result, long? maxBitrate)
+    {
+        if (maxBitrate.HasValue)
+        {
+            return maxBitrate;
+        }
+
+        var fallbacks = result.MediaSources
+            .Select(i => i.FallbackMaxStreamingBitrate)
+            .Where(i => i.HasValue && i.Value > 0)
+            .Select(i => (long)i!.Value)
+            .ToArray();
+
+        return fallbacks.Length > 0 ? fallbacks.Min() : null;
+    }
+
+    private static int GetCapabilityTier(MediaSourceInfo mediaSource)
+    {
+        // Local file direct-play remains the top preference.
+        if (mediaSource.SupportsDirectPlay && mediaSource.Protocol == MediaProtocol.File)
+        {
+            return 0;
+        }
+
+        if (mediaSource.SupportsDirectPlay || mediaSource.SupportsDirectStream)
+        {
+            return 1;
+        }
+
+        return 2;
+    }
+
+    private static int GetBitrateBucket(MediaSourceInfo mediaSource, long? maxBitrate)
+    {
+        if (!maxBitrate.HasValue || !mediaSource.Bitrate.HasValue)
+        {
+            return 1;
+        }
+
+        return mediaSource.Bitrate.Value <= maxBitrate.Value ? 0 : 2;
+    }
+
+    private static long GetBitrateOvershoot(MediaSourceInfo mediaSource, long? maxBitrate)
+    {
+        if (!maxBitrate.HasValue || !mediaSource.Bitrate.HasValue)
+        {
+            return long.MaxValue;
+        }
+
+        return mediaSource.Bitrate.Value <= maxBitrate.Value
+            ? long.MaxValue
+            : mediaSource.Bitrate.Value - maxBitrate.Value;
     }
 
     /// <summary>

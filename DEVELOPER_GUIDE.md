@@ -136,6 +136,32 @@ Relevant CLI options are defined in `Jellyfin.Server/StartupOptions.cs`:
 
 You can also run the built DLL or executable from `Jellyfin.Server/bin/Debug/net10.0/`.
 
+## Windows Self-Contained Publish (Server + Web, FFmpeg External)
+
+Use the publish script to produce a Windows `win-x64` self-contained output that includes the web client but does **not** bundle FFmpeg:
+
+```powershell
+pwsh ./scripts/publish-win-server-web.ps1
+```
+
+Useful options:
+
+- `-Runtime` (default: `win-x64`)
+- `-Configuration` (default: `Release`)
+- `-OutputPath` (default: `artifacts/publish/<runtime>`)
+- `-SkipWebBuild` (reuse existing `Client/jellyfin-web-master/dist`)
+- `-SkipNpmInstall` (skip `npm ci` during web build)
+
+Output layout:
+
+- `artifacts/publish/win-x64/server/` (server publish output)
+- `artifacts/publish/win-x64/server/jellyfin-web/` (copied web build)
+
+FFmpeg requirement is unchanged:
+
+- Provide `ffmpeg` in system `PATH`, or
+- Launch with `--ffmpeg <path-to-ffmpeg.exe>`.
+
 ## VS Code + Launch Profiles
 
 See `jellyfin.code-workspace` and `.vscode/launch.json`.
