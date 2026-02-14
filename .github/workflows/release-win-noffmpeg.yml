@@ -1,0 +1,92 @@
+name: Release - Windows NoFFmpeg Bundle
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    name: Build and Upload Windows Bundle
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout server repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@baa11fbfe1d6520db94683bd5c7a3818018e4309 # v5.1.0
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Clone jellyfin-web
+        shell: pwsh
+        run: |
+          git clone https://github.com/jellyfin/jellyfin-web.git jellyfin-web
+          cd jellyfin-web
+          git fetch --tags --force
+          $tagName = "${{ github.ref_name }}"
+          if (git rev-parse -q --verify "refs/tags/$tagName" *> $null) {
+            Write-Host "Using jellyfin-web tag: $tagName"
+            git checkout "tags/$tagName"
+          } else {
+            Write-Host "Tag '$tagName' not found in jellyfin-web, falling back to master."
+            git checkout master
+          }
+
+      - name: Build jellyfin-web dist
+        shell: pwsh
+        run: |
+          cd jellyfin-web
+          npm ci
+          npm run build:production
+
+      - name: Publish server (self-contained win-x64)
+        shell: pwsh
+        run: |
+          dotnet publish Jellyfin.Server/Jellyfin.Server.csproj `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            --output artifacts/publish/win-x64/server
+
+      - name: Copy web dist into server publish output
+        shell: pwsh
+        run: |
+          $publishRoot = "artifacts/publish/win-x64/server"
+          $webTarget = Join-Path $publishRoot "jellyfin-web"
+          if (Test-Path $webTarget) {
+            Remove-Item $webTarget -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $webTarget -Force | Out-Null
+          Copy-Item "jellyfin-web/dist/*" $webTarget -Recurse -Force
+
+      - name: Create release zip asset (no ffmpeg)
+        id: package
+        shell: pwsh
+        run: |
+          $tagName = "${{ github.ref_name }}"
+          $assetName = "jellyfin-win-x64-noffmpeg-$tagName.zip"
+          Compress-Archive -Path "artifacts/publish/win-x64/server/*" -DestinationPath $assetName -Force
+          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
+
+      - name: Upload asset to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: ${{ steps.package.outputs.asset_name }}
+          generate_release_notes: true
+          append_body: true
+          body: |
+            Windows self-contained Jellyfin server + web bundle.
+            FFmpeg is intentionally not included.
+            Use system PATH or `--ffmpeg <path-to-ffmpeg.exe>` when running.
